@@ -293,6 +293,164 @@ local function get_fence_info(line)
 	return nil
 end
 
+--------------------------------------------------------------------------------
+-- Comment Formatting (Treesitter-based)
+--------------------------------------------------------------------------------
+
+local function get_comment_nodes(bufnr)
+	local ok, parser = pcall(vim.treesitter.get_parser, bufnr)
+	if not ok or not parser then
+		return {}
+	end
+	local root = parser:parse()[1]:root()
+	local query = vim.treesitter.query.parse(vim.bo[bufnr].filetype, "(comment) @comment")
+	local nodes = {}
+	for _, node in query:iter_captures(root, bufnr) do
+		table.insert(nodes, node)
+	end
+	return nodes
+end
+
+local function strip_line_comment(line)
+	-- Match common line comment prefixes, preserving leading whitespace
+	local prefix_patterns = {
+		"^(%s*//%s?)", -- C/C++/Java/JS/TS/Rust/Go
+		"^(%s*#%s?)", -- Python/Ruby/Shell/YAML/TOML
+		"^(%s*;%s?)", -- Lisp/Clojure/INI
+		"^(%s*%-%-%s?)", -- Lua/Haskell/SQL
+		"^(%s*%%%s?)", -- LaTeX/Erlang
+		"^(%s*\"%s?)", -- Vimscript
+	}
+	for _, pat in ipairs(prefix_patterns) do
+		local prefix = line:match(pat)
+		if prefix then
+			local content = line:sub(#prefix + 1)
+			return prefix, content
+		end
+	end
+	return nil, line
+end
+
+local function strip_block_comment_line(line)
+	-- Lines inside a block comment may have a leading * or space
+	local star_prefix = line:match("^(%s*%*%s?)")
+	if star_prefix then
+		return star_prefix, line:sub(#star_prefix + 1)
+	end
+	local bare_space = line:match("^(%s+)")
+	if bare_space then
+		return bare_space, line:sub(#bare_space + 1)
+	end
+	return "", line
+end
+
+function M.format_buffer_comments(bufnr)
+	bufnr = (bufnr == nil or bufnr == 0) and vim.api.nvim_get_current_buf() or bufnr
+	if not vim.api.nvim_buf_is_valid(bufnr) then
+		return
+	end
+	if not config.get("enable_comment_format") then
+		return
+	end
+
+	local nodes = get_comment_nodes(bufnr)
+	if #nodes == 0 then
+		return
+	end
+
+	local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, true)
+	local changed = false
+
+	for _, node in ipairs(nodes) do
+		local start_row, start_col, end_row, end_col = node:range()
+		-- start_row/end_row are 0-based
+
+		if start_row == end_row then
+			-- Single-line comment
+			local line = lines[start_row + 1]
+			-- Extract the comment portion from the line
+			local before = line:sub(1, start_col)
+			local comment_text = line:sub(start_col + 1, end_col)
+			local prefix, content = strip_line_comment(comment_text)
+			if prefix then
+				local formatted = M.format(content)
+				if formatted ~= content then
+					lines[start_row + 1] = before .. prefix .. formatted
+					changed = true
+				end
+			end
+		else
+			-- Multi-line (block) comment
+			local is_block = false
+			local first_line = lines[start_row + 1]
+			local comment_text = first_line:sub(start_col + 1)
+
+			-- Detect block comment style
+			local opening, first_content
+			if comment_text:match("^/%*") then
+				-- C-style /* ... */
+				opening = comment_text:match("^(/%*%s?)")
+				first_content = comment_text:sub(#opening + 1)
+				is_block = true
+			elseif comment_text:match("^%-%-%[%[") then
+				-- Lua --[[ ... ]]
+				opening = comment_text:match("^(%-%-%[%[%s?)")
+				first_content = comment_text:sub(#opening + 1)
+				is_block = true
+			end
+
+			if is_block then
+				-- Format first line (after opening delimiter)
+				local before = first_line:sub(1, start_col)
+				local fmt_first = M.format(first_content)
+				if fmt_first ~= first_content then
+					lines[start_row + 1] = before .. opening .. fmt_first
+					changed = true
+				end
+
+				-- Format middle lines
+				for row = start_row + 1, end_row - 1 do
+					local mid_line = lines[row + 1]
+					local mid_prefix, mid_content = strip_block_comment_line(mid_line)
+					local fmt_mid = M.format(mid_content)
+					if fmt_mid ~= mid_content then
+						lines[row + 1] = mid_prefix .. fmt_mid
+						changed = true
+					end
+				end
+
+				-- Format last line (before closing delimiter)
+				local last_line = lines[end_row + 1]
+				local last_content = last_line:sub(1, end_col)
+				local closing = last_line:sub(end_col + 1)
+				local last_prefix, last_inner = strip_block_comment_line(last_content)
+				local fmt_last = M.format(last_inner)
+				if fmt_last ~= last_inner then
+					lines[end_row + 1] = last_prefix .. fmt_last .. closing
+					changed = true
+				end
+			else
+				-- Fallback: treat as consecutive single-line comments
+				for row = start_row, end_row do
+					local line = lines[row + 1]
+					local prefix, content = strip_line_comment(line)
+					if prefix then
+						local formatted = M.format(content)
+						if formatted ~= content then
+							lines[row + 1] = prefix .. formatted
+							changed = true
+						end
+					end
+				end
+			end
+		end
+	end
+
+	if changed then
+		vim.api.nvim_buf_set_lines(bufnr, 0, -1, true, lines)
+	end
+end
+
 function M.format_buffer(bufnr)
 	bufnr = (bufnr == nil or bufnr == 0) and vim.api.nvim_get_current_buf() or bufnr
 	if not vim.api.nvim_buf_is_valid(bufnr) then return end
